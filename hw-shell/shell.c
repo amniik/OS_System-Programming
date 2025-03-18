@@ -16,6 +16,10 @@
 /* Convenience macro to silence compiler warnings about unused function parameters. */
 #define unused __attribute__((unused))
 
+#define REDIRECTION_IN "<"
+#define REDIRECTION_OUT ">"
+#define PIPE "|"
+
 /* Whether the shell is connected to an actual terminal or not. */
 bool shell_is_interactive;
 
@@ -30,6 +34,8 @@ pid_t shell_pgid;
 
 int cmd_exit(struct tokens* tokens);
 int cmd_help(struct tokens* tokens);
+int cmd_pwd(struct tokens* tokens);
+int cmd_cd(struct tokens* tokens);
 
 /* Built-in command functions take token array (see parse.h) and return int */
 typedef int cmd_fun_t(struct tokens* tokens);
@@ -44,6 +50,8 @@ typedef struct fun_desc {
 fun_desc_t cmd_table[] = {
     {cmd_help, "?", "show this help menu"},
     {cmd_exit, "exit", "exit the command shell"},
+    {cmd_pwd, "pwd", "show the current working directory"},
+    {cmd_cd, "cd", "change the current working directory"}
 };
 
 /* Prints a helpful description for the given command */
@@ -55,6 +63,168 @@ int cmd_help(unused struct tokens* tokens) {
 
 /* Exits this shell */
 int cmd_exit(unused struct tokens* tokens) { exit(0); }
+
+int cmd_pwd(unused struct tokens* tokens) {
+  char *cwd = getcwd(NULL, 0);  // Let getcwd allocate the buffer
+    if (cwd != NULL) {
+        printf("%s\n", cwd);
+        free(cwd);  // Free the dynamically allocated memory
+    } else {
+        perror("");
+        return 1;
+    }
+    return 0;
+}
+
+int cmd_cd(struct tokens* tokens) {
+  if (tokens_get_length(tokens) != 2){
+    printf("cd command get exactly one argument\n");
+  } else{
+    if (chdir(tokens_get_token(tokens, 1)) != 0){
+      perror("");
+    }
+  }
+  return 0;
+}
+
+char* search_path_programs(char* cmd){
+  static char path_dir[4096];
+  char *path = getenv("PATH");
+  char path_copy[4096];
+  strncpy(path_copy, path, sizeof(path_copy) - 1);
+  char *saveptr;
+  char *dir;
+  dir = strtok_r(path_copy, ":", &saveptr);
+  while (dir != NULL) {
+      memset(path_dir, 0, sizeof(path_dir));
+      strncpy(path_dir, dir, sizeof(path_dir) - 1);  // Copy the directory path
+      path_dir[sizeof(path_dir) - 1] = '\0';          // Ensure null-termination
+      strcat(path_dir, "/");
+      strcat(path_dir, cmd);
+      if (access(path_dir, F_OK) == 0)
+        return path_dir;
+      dir = strtok_r(NULL, ":", &saveptr);
+  } 
+  return NULL;
+}
+
+int redirect(bool in, char* path){
+  int flag;
+  int std_fd;
+  int file_fd;
+
+  if (in){
+    flag = O_RDONLY;
+    std_fd = STDIN_FILENO;
+  } else {
+    flag = O_WRONLY | O_CREAT | O_TRUNC;
+    std_fd = STDOUT_FILENO;
+  }
+  if (in){
+    file_fd = open(path, flag);
+    if (file_fd < 0) {
+        return 1;
+    }
+  }else {
+    file_fd = open(path, flag, 0644);
+    if (file_fd < 0) {
+        close(file_fd);
+        return 1;
+    }
+  }
+  if (dup2(file_fd, std_fd) < 0) {
+        close(file_fd);
+        return 1;
+  }
+  
+  close(file_fd);
+  return 0;
+}
+
+int handle_args(char **args, struct tokens* tokens, char* program, size_t start, size_t end){
+  char *token;
+  bool redirect_in;
+  bool redirect_out;
+  int index = 1;
+
+  args[0] = program;
+  for (size_t i = start + 1; i < end; i++) {
+    token =  tokens_get_token(tokens, i);
+    if (redirect_in){
+      if (redirect(true, token) == 1) {
+        return 1;
+      }
+      redirect_in = false;
+    } else if (redirect_out) {
+      if (redirect(false, token) == 1){
+        return 1;
+      }
+      redirect_out = false; 
+    } else if (strcmp(token, REDIRECTION_IN) == 0){
+      redirect_in = true;
+      continue;
+    } else if (strcmp(token, REDIRECTION_OUT) == 0){
+      redirect_out = true;
+      continue;
+    } else{
+      args[index++] = tokens_get_token(tokens, i);
+    }
+  }
+  args[index] = NULL;
+
+  return 0;
+
+}
+
+int exec_program(struct tokens* tokens, size_t start, size_t end, int pipes[][2], int n_proc){
+  pid_t pid = fork();
+  if (pid < 0) {
+    perror("fork failed");
+  } else if (pid == 0) {
+    if (n_proc != -1){
+      if (end != tokens_get_length(tokens)){
+        close(pipes[n_proc][0]); // Close unused read end of the pipe
+        // Redirect stdout to the write end of the pipe
+        if (dup2(pipes[n_proc][1], STDOUT_FILENO) == -1) {
+            perror("dup2");
+        }
+        close(pipes[n_proc][1]); // Close the original write descriptor
+      }
+
+      if (start != 0){
+        close(pipes[n_proc - 1][1]); // Close unused write end of the pipe
+        // Redirect stdin to the read end of the pipe
+        if (dup2(pipes[n_proc - 1][0], STDIN_FILENO) == -1) {
+            printf("%d\n", n_proc);
+            perror("dup2");
+        }
+        close(pipes[n_proc - 1][0]); // Close the original write descriptor
+      }
+    }
+    char *args[end - start];
+    char* program;
+    program = search_path_programs(tokens_get_token(tokens, start));
+    if (program == NULL)
+      program = tokens_get_token(tokens, start);
+    if (handle_args(args, tokens, program, start, end) == 1){
+      perror("arguments are not correct");
+      return 1;
+    }
+    if (execv(program, args) == -1) {
+      perror("execv failed");
+      return 1;
+    }
+  } else{
+    int status;
+    if (n_proc != -1 && start != 0){
+      close(pipes[n_proc - 1][0]);
+      close(pipes[n_proc - 1][1]);
+    }
+    waitpid(pid, &status, 0);
+  }
+  
+  return 0;
+}
 
 /* Looks up the built-in command, if it exists. */
 int lookup(char cmd[]) {
@@ -111,7 +281,23 @@ int main(unused int argc, unused char* argv[]) {
       cmd_table[fundex].fun(tokens);
     } else {
       /* REPLACE this to run commands as programs. */
-      fprintf(stdout, "This shell doesn't know how to run programs.\n");
+      int pipes [4096][2];
+      int n_proc = 0;
+      size_t start = 0;
+      for (size_t i = 0; i < tokens_get_length(tokens); i++) {
+        if (strcmp(tokens_get_token(tokens, i), PIPE) == 0){
+          if (pipe(pipes[n_proc]) == -1) {
+            perror("pipe");
+          }
+          exec_program(tokens, start, i, pipes, n_proc++);
+          start = i + 1;
+        }
+      }
+      if (n_proc == 0) {
+        exec_program(tokens, start, tokens_get_length(tokens), pipes, -1);
+      } else {
+        exec_program(tokens, start, tokens_get_length(tokens), pipes, n_proc);
+      }
     }
 
     if (shell_is_interactive)
