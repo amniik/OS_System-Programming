@@ -259,10 +259,82 @@ struct Elf32_Phdr {
 #define PF_W 2 /* Writable. */
 #define PF_R 4 /* Readable. */
 
+#define MAX_ARGS 32
+
+bool parse_filename(const char* file_name, int* argc, char* argv[]);
+void load_arguments(int argc, char** argv, void** esp);
 static bool setup_stack(void** esp);
 static bool validate_segment(const struct Elf32_Phdr*, struct file*);
 static bool load_segment(struct file* file, off_t ofs, uint8_t* upage, uint32_t read_bytes,
                          uint32_t zero_bytes, bool writable);
+
+bool parse_filename(const char* file_name, int* argc, char* argv[]){
+  if (file_name == NULL) return false;
+
+  char* fn_copy = palloc_get_page(0);
+  if (fn_copy == NULL)
+    return false;
+  strlcpy(fn_copy, file_name, PGSIZE);
+
+  char* token;
+  char *saveptr;
+  token = strtok_r(fn_copy, " ", &saveptr);
+  while (token != NULL && *argc < MAX_ARGS) {
+    argv[*argc] = palloc_get_page(0);
+    strlcpy(argv[*argc], token, strlen(token) + 1);
+    token = strtok_r(NULL, " ", &saveptr);
+    (*argc)++;
+  }
+  palloc_free_page(fn_copy);
+  return true;
+}
+
+void load_arguments(int argc, char** argv, void** esp) {
+  size_t align = 0;
+  uint32_t *argv_address[argc];
+
+  //Push argv elements
+  for (int i = 0; i < argc; i++)
+  {
+    size_t len = strlen(argv[i]) + 1;
+    *esp = (char*)((char*)*esp - len);
+    strlcpy((char*)*esp, argv[i], len);
+    argv_address[i] = (uint32_t*)*esp;
+    align += len;
+  }
+
+  align = align % 4;
+    if (align != 0) {
+        *esp = (void*)((char*)*esp - (4 - align));
+        memset(*esp, 0, 4 - align);  // Zero-fill alignment padding
+  }
+
+  // Push argv[] pointers in reverse order
+  for (int i = argc; i >= 0; i--)
+  {
+    *(uint32_t **)esp = (uint32_t *)(*esp - sizeof(uint32_t*));
+    if (i == argc)
+    {
+      **(uint32_t **)esp = (uint32_t) 0;
+    }else
+    {
+      **(uint32_t **)esp = (uint32_t) argv_address[i];
+    }
+  }
+
+  // Push argv address
+  char** argv_ptr = (char**)*esp;
+  *esp = (char*)((char*)*esp - sizeof(char**));
+  *(char***)*esp = argv_ptr;
+
+  // Push argc
+  *esp = (char*)((char*)*esp - sizeof(int));
+  *(int*)*esp = argc;
+
+  // Push return address (dummy 0)
+  *esp = (char*)((char*)*esp - sizeof(void*));
+  *(void**)*esp = 0;
+}
 
 /* Loads an ELF executable from FILE_NAME into the current thread.
    Stores the executable's entry point into *EIP
@@ -270,22 +342,25 @@ static bool load_segment(struct file* file, off_t ofs, uint8_t* upage, uint32_t 
    Returns true if successful, false otherwise. */
 bool load(const char* file_name, void (**eip)(void), void** esp) {
   struct thread* t = thread_current();
+  char* argv[MAX_ARGS];
   struct Elf32_Ehdr ehdr;
   struct file* file = NULL;
   off_t file_ofs;
   bool success = false;
   int i;
+  int argc;
 
   /* Allocate and activate page directory. */
   t->pcb->pagedir = pagedir_create();
   if (t->pcb->pagedir == NULL)
     goto done;
   process_activate();
+  parse_filename(file_name, &argc, argv);
 
   /* Open executable file. */
-  file = filesys_open(file_name);
+  file = filesys_open(argv[0]);
   if (file == NULL) {
-    printf("load: %s: open failed\n", file_name);
+    printf("load: %s: open failed\n", argv[0]);
     goto done;
   }
 
@@ -353,8 +428,14 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
 
   /* Start address. */
   *eip = (void (*)(void))ehdr.e_entry;
-
+  load_arguments(argc, argv, esp);
   success = true;
+
+  /* Free argv elements*/
+  for (int i = 0; i < argc; i++)
+  {
+    palloc_free_page(argv[i]);
+  }
 
 done:
   /* We arrive here whether the load is successful or not. */
